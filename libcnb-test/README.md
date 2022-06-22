@@ -15,35 +15,36 @@ Please use the same tag for feature requests.
 
 ```rust,no_run
 // In $CRATE_ROOT/tests/integration_test.rs
-use libcnb_test::{IntegrationTest, BuildpackReference, assert_contains};
+use libcnb_test::{assert_contains, BuildpackReference, TestRunner, TestConfig};
 
 #[test]
 fn test() {
-    IntegrationTest::new("heroku/builder:22", "test-fixtures/app")
-        .buildpacks(vec![
-            BuildpackReference::Other(String::from("heroku/openjdk")),
-            BuildpackReference::Crate,
-        ])
-        .run_test(|context| {
+    TestRunner::default().run_test(
+        TestConfig::new("heroku/builder:22", "test-fixtures/app"),
+        |context| {
             assert_contains!(context.pack_stdout, "---> Maven Buildpack");
             assert_contains!(context.pack_stdout, "---> Installing Maven");
             assert_contains!(context.pack_stdout, "---> Running mvn package");
 
-            context.prepare_container().expose_port(12345).start(|container| {
-                assert_eq!(
-                    call_test_fixture_service(
-                        container.address_for_port(12345).unwrap(),
-                        "Hagbard Celine"
-                    )
-                    .unwrap(),
-                    "enileC drabgaH"
-                );
-            });
-        });
+            context
+                .prepare_container()
+                .expose_port(12345)
+                .start_with_default_process(|container| {
+                    assert_eq!(
+                        call_test_fixture_service(
+                            container.address_for_port(12345).unwrap(),
+                            "Hagbard Celine"
+                        )
+                        .unwrap(),
+                        "enileC drabgaH"
+                    );
+                });
+        },
+    );
 }
 
 fn call_test_fixture_service(addr: std::net::SocketAddr, payload: &str) -> Result<String, ()> {
-   unimplemented!()
+    unimplemented!()
 }
 ```
 

@@ -13,63 +13,25 @@ mod container_port_mapping;
 mod log;
 mod macros;
 mod pack;
+mod runner;
 mod util;
 
 pub use crate::container_context::{ContainerContext, PrepareContainerContext};
 use crate::pack::{PackBuildCommand, PullPolicy};
+pub use crate::runner::TestRunner;
 use bollard::image::RemoveImageOptions;
-use bollard::Docker;
+use std::borrow::BorrowMut;
 use std::collections::HashMap;
-use std::env;
-use std::env::VarError;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 
-/// Main type for libcnb integration tests.
-///
-/// # Dependencies
-/// Integration tests require external tools to be available on the host to run:
-/// - [pack](https://buildpacks.io/docs/tools/pack/)
-/// - [Docker](https://www.docker.com/)
-///
-/// # Example
-/// ```no_run
-/// use libcnb_test::{IntegrationTest, BuildpackReference, assert_contains};
-///
-/// # fn call_test_fixture_service(addr: std::net::SocketAddr, payload: &str) -> Result<String, ()> {
-/// #    unimplemented!()
-/// # }
-/// IntegrationTest::new("heroku/builder:22", "test-fixtures/app")
-///     .buildpacks(vec![
-///         BuildpackReference::Other(String::from("heroku/openjdk")),
-///         BuildpackReference::Crate,
-///     ])
-///     .run_test(|context| {
-///         assert_contains!(context.pack_stdout, "---> Maven Buildpack");
-///         assert_contains!(context.pack_stdout, "---> Installing Maven");
-///         assert_contains!(context.pack_stdout, "---> Running mvn package");
-///
-///         context.prepare_container().expose_port(12345).start_with_default_process(|container| {
-///             assert_eq!(
-///                 call_test_fixture_service(
-///                     container.address_for_port(12345).unwrap(),
-///                     "Hagbard Celine"
-///                 )
-///                 .unwrap(),
-///                 "enileC drabgaH"
-///             );
-///         });
-///     });
-/// ```
-pub struct IntegrationTest {
+/// Configuration for a test.
+pub struct TestConfig {
     app_dir: PathBuf,
     target_triple: String,
     builder_name: String,
     buildpacks: Vec<BuildpackReference>,
     env: HashMap<String, String>,
     app_dir_preprocessor: Option<Box<dyn Fn(PathBuf)>>,
-    docker: Docker,
-    tokio_runtime: tokio::runtime::Runtime,
 }
 
 /// References a Cloud Native Buildpack
@@ -81,50 +43,20 @@ pub enum BuildpackReference {
     Other(String),
 }
 
-impl IntegrationTest {
-    /// Creates a new integration test.
+impl TestConfig {
+    /// Creates a new test configuration.
     ///
     /// If the `app_dir` parameter is a relative path, it is treated as relative to the Cargo
     /// manifest directory ([`CARGO_MANIFEST_DIR`](https://doc.rust-lang.org/cargo/reference/environment-variables.html#environment-variables-cargo-sets-for-crates)),
     /// i.e. the package's root directory.
-    ///
-    /// # Panics
-    /// - When the connection to Docker failed
-    /// - When the internal Tokio runtime could not be created
     pub fn new(builder_name: impl Into<String>, app_dir: impl AsRef<Path>) -> Self {
-        let tokio_runtime =
-            tokio::runtime::Runtime::new().expect("Could not create internal Tokio runtime");
-
-        let docker = match env::var("DOCKER_HOST") {
-            #[cfg(target_family = "unix")]
-            Ok(docker_host) if docker_host.starts_with("unix://") => {
-                Docker::connect_with_unix_defaults()
-            }
-            Ok(docker_host)
-                if docker_host.starts_with("tcp://") || docker_host.starts_with("https://") =>
-            {
-                #[cfg(not(feature = "remote-docker"))]
-                panic!("Cannot connect to DOCKER_HOST '{docker_host}' since it requires TLS. Please use a local Docker daemon instead (recommended), or else enable the experimental `remote-docker` feature.");
-                #[cfg(feature = "remote-docker")]
-                Docker::connect_with_ssl_defaults()
-            }
-            Ok(docker_host) => panic!("Cannot connect to unsupported DOCKER_HOST '{docker_host}'"),
-            Err(VarError::NotPresent) => Docker::connect_with_local_defaults(),
-            Err(VarError::NotUnicode(_)) => {
-                panic!("DOCKER_HOST environment variable is not unicode encoded!")
-            }
-        }
-        .expect("Could not connect to local Docker daemon");
-
-        IntegrationTest {
+        TestConfig {
             app_dir: PathBuf::from(app_dir.as_ref()),
             target_triple: String::from("x86_64-unknown-linux-musl"),
             builder_name: builder_name.into(),
             buildpacks: vec![BuildpackReference::Crate],
             env: HashMap::new(),
             app_dir_preprocessor: None,
-            docker,
-            tokio_runtime,
         }
     }
 
@@ -151,14 +83,16 @@ impl IntegrationTest {
     ///
     /// # Example
     /// ```no_run
-    /// use libcnb_test::IntegrationTest;
+    /// use libcnb_test::{TestConfig, TestRunner};
     ///
-    /// IntegrationTest::new("heroku/builder:22", "test-fixtures/app")
-    ///     .env("ENV_VAR_ONE", "VALUE ONE")
-    ///     .env("ENV_VAR_TWO", "SOME OTHER VALUE")
-    ///     .run_test(|context| {
+    /// TestRunner::default().run_test(
+    ///     TestConfig::new("heroku/builder:22", "test-fixtures/app")
+    ///         .env("ENV_VAR_ONE", "VALUE ONE")
+    ///         .env("ENV_VAR_TWO", "SOME OTHER VALUE"),
+    ///     |context| {
     ///         // ...
-    ///     })
+    ///     },
+    /// )
     /// ```
     pub fn env(&mut self, k: impl Into<String>, v: impl Into<String>) -> &mut Self {
         self.env.insert(k.into(), v.into());
@@ -172,13 +106,17 @@ impl IntegrationTest {
     ///
     /// # Example
     /// ```no_run
-    /// use libcnb_test::IntegrationTest;
+    /// use libcnb_test::{TestConfig, TestRunner};
     ///
-    /// IntegrationTest::new("heroku/builder:22", "test-fixtures/app")
-    ///     .envs(vec![("ENV_VAR_ONE", "VALUE ONE"), ("ENV_VAR_TWO", "SOME OTHER VALUE")])
-    ///     .run_test(|context| {
+    /// TestRunner::default().run_test(
+    ///     TestConfig::new("heroku/builder:22", "test-fixtures/app").envs(vec![
+    ///         ("ENV_VAR_ONE", "VALUE ONE"),
+    ///         ("ENV_VAR_TWO", "SOME OTHER VALUE"),
+    ///     ]),
+    ///     |context| {
     ///         // ...
-    ///     })
+    ///     },
+    /// );
     /// ```
     pub fn envs<K: Into<String>, V: Into<String>, I: IntoIterator<Item = (K, V)>>(
         &mut self,
@@ -201,148 +139,41 @@ impl IntegrationTest {
     ///
     /// # Example
     /// ```no_run
-    /// use libcnb_test::IntegrationTest;
+    /// use libcnb_test::{TestConfig, TestRunner};
     ///
-    /// IntegrationTest::new("heroku/builder:22", "test-fixtures/app")
-    ///     .app_dir_preprocessor(|app_dir| {
-    ///         std::fs::remove_file(app_dir.join("Procfile")).unwrap()
-    ///     })
-    ///     .run_test(|context| {
+    /// TestRunner::default().run_test(
+    ///     TestConfig::new("heroku/builder:22", "test-fixtures/app").app_dir_preprocessor(
+    ///         |app_dir| std::fs::remove_file(app_dir.join("Procfile")).unwrap(),
+    ///     ),
+    ///     |context| {
     ///         // ...
-    ///     })
+    ///     },
+    /// );
     /// ```
     pub fn app_dir_preprocessor<F: 'static + Fn(PathBuf)>(&mut self, f: F) -> &mut Self {
         self.app_dir_preprocessor = Some(Box::new(f));
         self
     }
-
-    /// Starts a new integration test run.
-    ///
-    /// This function will copy the application to a temporary directory, cross-compiles this crate,
-    /// packages it as a buildpack and then invokes [pack](https://buildpacks.io/docs/tools/pack/)
-    /// to build a new Docker image with the buildpacks specified by this integration test instance.
-    ///
-    /// Since this function is supposed to only be used in integration tests, failures are not
-    /// signalled via [`Result`](Result) values. Instead, this function panics whenever an unexpected error
-    /// occurred to simplify testing code.
-    ///
-    /// # Panics
-    /// - When the app could not be copied
-    /// - When this crate could not be packed as a buildpack
-    /// - When the "pack" command unexpectedly fails
-    ///
-    /// # Example
-    /// ```no_run
-    /// use libcnb_test::{IntegrationTest, assert_contains};
-    ///
-    /// IntegrationTest::new("heroku/builder:22", "test-fixtures/app")
-    ///     .run_test(|context| {
-    ///         assert_contains!(context.pack_stdout, "---> Ruby Buildpack");
-    ///         assert_contains!(context.pack_stdout, "---> Installing bundler");
-    ///         assert_contains!(context.pack_stdout, "---> Installing gems");
-    ///     })
-    /// ```
-    pub fn run_test<F: FnOnce(IntegrationTestContext)>(&mut self, f: F) {
-        let app_dir = if self.app_dir.is_relative() {
-            env::var("CARGO_MANIFEST_DIR")
-                .map(PathBuf::from)
-                .expect("Could not determine Cargo manifest directory")
-                .join(&self.app_dir)
-        } else {
-            self.app_dir.clone()
-        };
-
-        let temp_app_dir =
-            app::copy_app(&app_dir).expect("Could not copy app to temporary location");
-
-        if let Some(app_dir_preprocessor) = &self.app_dir_preprocessor {
-            (app_dir_preprocessor)(PathBuf::from(temp_app_dir.path()));
-        }
-
-        let temp_crate_buildpack_dir = if self.buildpacks.contains(&BuildpackReference::Crate) {
-            Some(
-                build::package_crate_buildpack(&self.target_triple)
-                    .expect("Could not package current crate as buildpack"),
-            )
-        } else {
-            None
-        };
-
-        let image_name = util::random_docker_identifier();
-
-        let mut pack_command = PackBuildCommand::new(
-            &self.builder_name,
-            temp_app_dir.path(),
-            &image_name,
-            // Prevent redundant image-pulling, which slows tests and risks hitting registry rate limits.
-            PullPolicy::IfNotPresent,
-        );
-
-        self.env.iter().for_each(|(key, value)| {
-            pack_command.env(key, value);
-        });
-
-        for buildpack in &self.buildpacks {
-            match buildpack {
-                BuildpackReference::Crate => {
-                    pack_command.buildpack(temp_crate_buildpack_dir.as_ref()
-                        .expect("Test references crate buildpack, but crate wasn't packaged as a buildpack. This is an internal libcnb-test error, please report any occurrences."))
-                }
-                BuildpackReference::Other(id) => pack_command.buildpack(id.clone()),
-            };
-        }
-
-        let output = Command::from(pack_command)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("Could not spawn external 'pack' process")
-            .wait_with_output()
-            .expect("Error while waiting on external 'pack' process");
-
-        let integration_test_context = IntegrationTestContext {
-            pack_stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-            pack_stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-            image_name,
-            app_dir: PathBuf::from(temp_app_dir.path()),
-            integration_test: self,
-        };
-
-        if output.status.success() {
-            f(integration_test_context);
-        } else {
-            panic!(
-                "pack command failed with exit-code {}!\n\npack stdout:\n{}\n\npack stderr:\n{}",
-                output
-                    .status
-                    .code()
-                    .map_or(String::from("<unknown>"), |exit_code| exit_code.to_string()),
-                integration_test_context.pack_stdout,
-                integration_test_context.pack_stderr
-            )
-        }
-    }
 }
 
-/// Context for a currently executing integration test.
-pub struct IntegrationTestContext<'a> {
+/// Context for a currently executing test.
+pub struct TestContext<'a> {
     /// Standard output of `pack`, interpreted as an UTF-8 string.
     pub pack_stdout: String,
     /// Standard error of `pack`, interpreted as an UTF-8 string.
     pub pack_stderr: String,
-    /// The name of the image this integration test created.
-    pub image_name: String,
     /// The directory of the app this integration test uses.
     ///
-    /// This is a copy of the `app_dir` directory passed to [`IntegrationTest::new`] and unique to
+    /// This is a copy of the `app_dir` directory passed to [`TestConfig::new`] and unique to
     /// this integration test run. It is safe to modify the directory contents inside the test.
     pub app_dir: PathBuf,
 
-    integration_test: &'a IntegrationTest,
+    image_name: String,
+    runner: &'a TestRunner,
 }
 
-impl<'a> IntegrationTestContext<'a> {
-    /// Prepares a new container with the image from the integration test.
+impl<'a> TestContext<'a> {
+    /// Prepares a new container with the image from the test.
     ///
     /// This will not create nor run the container immediately. Use the returned
     /// `PrepareContainerContext` to configure the container, then call
@@ -352,34 +183,76 @@ impl<'a> IntegrationTestContext<'a> {
     /// # Example:
     ///
     /// ```no_run
-    /// use libcnb_test::IntegrationTest;
+    /// use libcnb_test::{TestConfig, TestRunner};
     ///
-    /// IntegrationTest::new("heroku/builder:22", "test-fixtures/empty-app").run_test(|context| {
-    ///     context.prepare_container().start_with_default_process(|container| {
-    ///         // ...
-    ///     });
-    /// });
+    /// TestRunner::default().run_test(
+    ///     TestConfig::new("heroku/builder:22", "test-fixtures/empty-app"),
+    ///     |context| {
+    ///         context
+    ///             .prepare_container()
+    ///             .start_with_default_process(|container| {
+    ///                 // ...
+    ///             });
+    ///     },
+    /// );
     /// ```
     #[must_use]
     pub fn prepare_container(&self) -> PrepareContainerContext {
         PrepareContainerContext::new(self)
     }
+
+    /// Starts a subsequent integration test run.
+    ///
+    /// This function behaves exactly like [`TestRunner::run_test`], but it will reuse the OCI image
+    /// from the previous test, causing the CNB lifecycle to restore cached layers. It will use the
+    /// same [`TestRunner`] as the previous test run.
+    ///
+    /// This function allows testing of subsequent builds, including caching logic and buildpack
+    /// behaviour when build environment variables change, stacks are upgraded and more.
+    ///
+    /// Note that this function will consume the current context. This is because the image will
+    /// be changed by the subsequent test, invalidating the context. Running a subsequent test must
+    /// therefore be the last operation. You can nest subsequent runs if required.
+    ///
+    /// # Panics
+    /// - When the app could not be copied
+    /// - When this crate could not be packaged as a buildpack
+    /// - When the `pack` command unexpectedly fails
+    ///
+    /// # Example
+    /// ```no_run
+    /// use libcnb_test::{assert_contains, TestRunner, TestConfig};
+    ///
+    /// TestRunner::default().run_test(
+    ///     TestConfig::new("heroku/builder:22", "test-fixtures/app"),
+    ///     |context| {
+    ///         assert_contains!(context.pack_stdout, "---> Ruby Buildpack");
+    ///         assert_contains!(context.pack_stdout, "---> Installing bundler");
+    ///         assert_contains!(context.pack_stdout, "---> Installing gems");
+    ///     },
+    /// )
+    /// ```
+    pub fn run_test<F: FnOnce(TestContext), T: BorrowMut<TestConfig>>(self, test: T, f: F) {
+        self.runner
+            .run_test_internal(self.image_name.clone(), test, f);
+    }
 }
 
-impl<'a> Drop for IntegrationTestContext<'a> {
+impl<'a> Drop for TestContext<'a> {
     fn drop(&mut self) {
         // We do not care if image removal succeeded or not. Panicking here would result in
         // SIGILL since this function might be called in a Tokio runtime.
-        let _image_delete_result = self.integration_test.tokio_runtime.block_on(
-            self.integration_test.docker.remove_image(
-                &self.image_name,
-                Some(RemoveImageOptions {
-                    force: true,
-                    ..RemoveImageOptions::default()
-                }),
-                None,
-            ),
-        );
+        let _image_delete_result =
+            self.runner
+                .tokio_runtime
+                .block_on(self.runner.docker.remove_image(
+                    &self.image_name,
+                    Some(RemoveImageOptions {
+                        force: true,
+                        ..RemoveImageOptions::default()
+                    }),
+                    None,
+                ));
     }
 }
 

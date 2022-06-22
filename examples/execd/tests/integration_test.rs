@@ -7,20 +7,23 @@
 // https://rust-lang.github.io/rust-clippy/stable/index.html
 #![warn(clippy::pedantic)]
 
-use libcnb_test::{assert_contains, IntegrationTest};
+use libcnb_test::{assert_contains, TestConfig, TestRunner};
 
 #[test]
 #[ignore]
 fn basic() {
-    IntegrationTest::new("heroku/builder:22", "test-fixtures/empty-app").run_test(|context| {
-        context
-            .prepare_container()
-            .start_with_shell_command("env", |container| {
-                let env_stdout = container.logs_wait().stdout;
+    TestRunner::default().run_test(
+        TestConfig::new("heroku/builder:22", "test-fixtures/empty-app"),
+        |context| {
+            context
+                .prepare_container()
+                .start_with_shell_command("env", |container| {
+                    let env_stdout = container.logs_wait().stdout;
 
-                assert_contains!(env_stdout, "ROLL_1D6=");
-                assert_contains!(env_stdout, "ROLL_4D6=");
-                assert_contains!(env_stdout, "ROLL_1D20=");
-            });
-    });
+                    assert_contains!(env_stdout, "ROLL_1D6=");
+                    assert_contains!(env_stdout, "ROLL_4D6=");
+                    assert_contains!(env_stdout, "ROLL_1D20=");
+                });
+        },
+    );
 }

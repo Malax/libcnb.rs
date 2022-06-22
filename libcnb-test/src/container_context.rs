@@ -1,6 +1,6 @@
 use crate::log::LogOutput;
 use crate::{container_port_mapping, util};
-use crate::{log, IntegrationTestContext};
+use crate::{log, TestContext};
 use bollard::container::{
     Config, CreateContainerOptions, RemoveContainerOptions, StartContainerOptions,
 };
@@ -11,15 +11,15 @@ use std::net::SocketAddr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub struct PrepareContainerContext<'a> {
-    integration_test_context: &'a IntegrationTestContext<'a>,
+    test_context: &'a TestContext<'a>,
     exposed_ports: Vec<u16>,
     env: HashMap<String, String>,
 }
 
 impl<'a> PrepareContainerContext<'a> {
-    pub(crate) fn new(integration_test_context: &'a IntegrationTestContext) -> Self {
+    pub(crate) fn new(test_context: &'a TestContext) -> Self {
         Self {
-            integration_test_context,
+            test_context,
             exposed_ports: Vec::new(),
             env: HashMap::new(),
         }
@@ -38,16 +38,19 @@ impl<'a> PrepareContainerContext<'a> {
     ///
     /// # Example
     /// ```no_run
-    /// use libcnb_test::IntegrationTest;
+    /// use libcnb_test::{TestConfig, TestRunner};
     ///
-    /// IntegrationTest::new("heroku/builder:22", "test-fixtures/app").run_test(|context| {
-    ///     context
-    ///         .prepare_container()
-    ///         .env("FOO", "FOO_VALUE")
-    ///         .start_with_default_process(|container| {
-    ///             // ...
-    ///         })
-    /// });
+    /// TestRunner::default().run_test(
+    ///     TestConfig::new("heroku/builder:22", "test-fixtures/app"),
+    ///     |context| {
+    ///         context
+    ///             .prepare_container()
+    ///             .envs(vec![("FOO", "FOO_VALUE"), ("BAR", "BAR_VALUE")])
+    ///             .start_with_default_process(|container| {
+    ///                 // ...
+    ///             })
+    ///     },
+    /// );
     /// ```
     pub fn env(&mut self, key: impl Into<String>, value: impl Into<String>) -> &mut Self {
         self.env.insert(key.into(), value.into());
@@ -58,16 +61,19 @@ impl<'a> PrepareContainerContext<'a> {
     ///
     /// # Example
     /// ```no_run
-    /// use libcnb_test::IntegrationTest;
+    /// use libcnb_test::{TestConfig, TestRunner};
     ///
-    /// IntegrationTest::new("heroku/builder:22", "test-fixtures/app").run_test(|context| {
-    ///     context
-    ///         .prepare_container()
-    ///         .envs(vec![("FOO", "FOO_VALUE"), ("BAR", "BAR_VALUE")])
-    ///         .start_with_default_process(|container| {
-    ///             // ...
-    ///         })
-    /// });
+    /// TestRunner::default().run_test(
+    ///     TestConfig::new("heroku/builder:22", "test-fixtures/app"),
+    ///     |context| {
+    ///         context
+    ///             .prepare_container()
+    ///             .envs(vec![("FOO", "FOO_VALUE"), ("BAR", "BAR_VALUE")])
+    ///             .start_with_default_process(|container| {
+    ///                 // ...
+    ///             })
+    ///     },
+    /// );
     /// ```
     pub fn envs<K: Into<String>, V: Into<String>, I: IntoIterator<Item = (K, V)>>(
         &mut self,
@@ -187,48 +193,43 @@ impl<'a> PrepareContainerContext<'a> {
     ) {
         let container_name = util::random_docker_identifier();
 
-        self.integration_test_context
-            .integration_test
-            .tokio_runtime
-            .block_on(async {
-                self.integration_test_context
-                    .integration_test
-                    .docker
-                    .create_container(
-                        Some(CreateContainerOptions {
-                            name: container_name.clone(),
-                        }),
-                        Config {
-                            image: Some(self.integration_test_context.image_name.clone()),
-                            env: Some(self.env.iter().map(|(k, v)| format!("{k}={v}")).collect()),
-                            entrypoint,
-                            cmd,
-                            ..container_port_mapping::port_mapped_container_config(
-                                &self.exposed_ports,
-                            )
-                        },
-                    )
-                    .await
-                    .expect("Could not create container");
+        self.test_context.runner.tokio_runtime.block_on(async {
+            self.test_context
+                .runner
+                .docker
+                .create_container(
+                    Some(CreateContainerOptions {
+                        name: container_name.clone(),
+                    }),
+                    Config {
+                        image: Some(self.test_context.image_name.clone()),
+                        env: Some(self.env.iter().map(|(k, v)| format!("{k}={v}")).collect()),
+                        entrypoint,
+                        cmd,
+                        ..container_port_mapping::port_mapped_container_config(&self.exposed_ports)
+                    },
+                )
+                .await
+                .expect("Could not create container");
 
-                self.integration_test_context
-                    .integration_test
-                    .docker
-                    .start_container(&container_name, None::<StartContainerOptions<String>>)
-                    .await
-                    .expect("Could not start container");
-            });
+            self.test_context
+                .runner
+                .docker
+                .start_container(&container_name, None::<StartContainerOptions<String>>)
+                .await
+                .expect("Could not start container");
+        });
 
         f(ContainerContext {
             container_name,
-            integration_test_context: self.integration_test_context,
+            test_context: self.test_context,
         });
     }
 }
 
 pub struct ContainerContext<'a> {
     pub container_name: String,
-    pub(crate) integration_test_context: &'a IntegrationTestContext<'a>,
+    pub(crate) test_context: &'a TestContext<'a>,
 }
 
 impl<'a> ContainerContext<'a> {
@@ -285,12 +286,12 @@ impl<'a> ContainerContext<'a> {
         &self,
         logs_options: bollard::container::LogsOptions<T>,
     ) -> LogOutput {
-        self.integration_test_context
-            .integration_test
+        self.test_context
+            .runner
             .tokio_runtime
             .block_on(log::consume_container_log_output(
-                self.integration_test_context
-                    .integration_test
+                self.test_context
+                    .runner
                     .docker
                     .logs(&self.container_name, Some(logs_options)),
             ))
@@ -300,67 +301,61 @@ impl<'a> ContainerContext<'a> {
     /// # Panics
     #[must_use]
     pub fn address_for_port(&self, port: u16) -> Option<SocketAddr> {
-        self.integration_test_context
-            .integration_test
-            .tokio_runtime
-            .block_on(async {
-                self.integration_test_context
-                    .integration_test
-                    .docker
-                    .inspect_container(&self.container_name, None)
-                    .await
-                    .unwrap()
-                    .network_settings
-                    .and_then(|network_settings| network_settings.ports)
-                    .and_then(|ports| {
-                        container_port_mapping::parse_port_map(&ports)
-                            .unwrap()
-                            .get(&port)
-                            .copied()
-                    })
-            })
+        self.test_context.runner.tokio_runtime.block_on(async {
+            self.test_context
+                .runner
+                .docker
+                .inspect_container(&self.container_name, None)
+                .await
+                .unwrap()
+                .network_settings
+                .and_then(|network_settings| network_settings.ports)
+                .and_then(|ports| {
+                    container_port_mapping::parse_port_map(&ports)
+                        .unwrap()
+                        .get(&port)
+                        .copied()
+                })
+        })
     }
 
     /// Executes a shell command inside an already running container.
     ///
     /// # Panics
     pub fn shell_exec(&self, command: impl AsRef<str>) -> LogOutput {
-        self.integration_test_context
-            .integration_test
-            .tokio_runtime
-            .block_on(async {
-                let create_exec_result = self
-                    .integration_test_context
-                    .integration_test
-                    .docker
-                    .create_exec(
-                        &self.container_name,
-                        CreateExecOptions {
-                            cmd: Some(vec![CNB_LAUNCHER_PATH, SHELL_PATH, "-c", command.as_ref()]),
-                            attach_stdout: Some(true),
-                            ..CreateExecOptions::default()
-                        },
-                    )
-                    .await
-                    .unwrap();
+        self.test_context.runner.tokio_runtime.block_on(async {
+            let create_exec_result = self
+                .test_context
+                .runner
+                .docker
+                .create_exec(
+                    &self.container_name,
+                    CreateExecOptions {
+                        cmd: Some(vec![CNB_LAUNCHER_PATH, SHELL_PATH, "-c", command.as_ref()]),
+                        attach_stdout: Some(true),
+                        ..CreateExecOptions::default()
+                    },
+                )
+                .await
+                .unwrap();
 
-                let start_exec_result = self
-                    .integration_test_context
-                    .integration_test
-                    .docker
-                    .start_exec(&create_exec_result.id, None)
-                    .await
-                    .unwrap();
+            let start_exec_result = self
+                .test_context
+                .runner
+                .docker
+                .start_exec(&create_exec_result.id, None)
+                .await
+                .unwrap();
 
-                match start_exec_result {
-                    StartExecResults::Attached { output, .. } => {
-                        log::consume_container_log_output(output)
-                            .await
-                            .expect("Could not consume container log output")
-                    }
-                    StartExecResults::Detached => LogOutput::default(),
+            match start_exec_result {
+                StartExecResults::Attached { output, .. } => {
+                    log::consume_container_log_output(output)
+                        .await
+                        .expect("Could not consume container log output")
                 }
-            })
+                StartExecResults::Detached => LogOutput::default(),
+            }
+        })
     }
 }
 
@@ -368,22 +363,15 @@ impl<'a> Drop for ContainerContext<'a> {
     fn drop(&mut self) {
         // We do not care if container removal succeeded or not. Panicking here would result in
         // SIGILL since this function might be called in a Tokio runtime.
-        let _remove_container_result = self
-            .integration_test_context
-            .integration_test
-            .tokio_runtime
-            .block_on(
-                self.integration_test_context
-                    .integration_test
-                    .docker
-                    .remove_container(
-                        &self.container_name,
-                        Some(RemoveContainerOptions {
-                            force: true,
-                            ..RemoveContainerOptions::default()
-                        }),
-                    ),
-            );
+        let _remove_container_result = self.test_context.runner.tokio_runtime.block_on(
+            self.test_context.runner.docker.remove_container(
+                &self.container_name,
+                Some(RemoveContainerOptions {
+                    force: true,
+                    ..RemoveContainerOptions::default()
+                }),
+            ),
+        );
     }
 }
 
