@@ -20,22 +20,30 @@ pub use crate::container_context::{ContainerContext, PrepareContainerContext};
 use crate::pack::{PackBuildCommand, PullPolicy};
 pub use crate::runner::TestRunner;
 use bollard::image::RemoveImageOptions;
-use std::borrow::BorrowMut;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 /// Configuration for a test.
+#[derive(Clone)]
 pub struct TestConfig {
     app_dir: PathBuf,
     target_triple: String,
     builder_name: String,
     buildpacks: Vec<BuildpackReference>,
     env: HashMap<String, String>,
-    app_dir_preprocessor: Option<Box<dyn Fn(PathBuf)>>,
+    app_dir_preprocessor: Option<Rc<dyn Fn(PathBuf)>>,
+}
+
+// When builder functions are used on TestConfig, the return value is &mut TestConfig
+impl From<&mut TestConfig> for TestConfig {
+    fn from(c: &mut TestConfig) -> Self {
+        (*c).clone()
+    }
 }
 
 /// References a Cloud Native Buildpack
-#[derive(Eq, PartialEq, Debug)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub enum BuildpackReference {
     /// References the buildpack in the Rust Crate currently being tested
     Crate,
@@ -151,7 +159,7 @@ impl TestConfig {
     /// );
     /// ```
     pub fn app_dir_preprocessor<F: 'static + Fn(PathBuf)>(&mut self, f: F) -> &mut Self {
-        self.app_dir_preprocessor = Some(Box::new(f));
+        self.app_dir_preprocessor = Some(Rc::new(f));
         self
     }
 }
@@ -167,6 +175,8 @@ pub struct TestContext<'a> {
     /// This is a copy of the `app_dir` directory passed to [`TestConfig::new`] and unique to
     /// this integration test run. It is safe to modify the directory contents inside the test.
     pub app_dir: PathBuf,
+    /// The configuration used for this integration test.
+    pub config: TestConfig,
 
     image_name: String,
     runner: &'a TestRunner,
@@ -232,9 +242,23 @@ impl<'a> TestContext<'a> {
     ///     },
     /// )
     /// ```
-    pub fn run_test<F: FnOnce(TestContext), T: BorrowMut<TestConfig>>(self, test: T, f: F) {
+    pub fn run_test<C: Into<TestConfig>, F: FnOnce(TestContext)>(self, config: C, f: F) {
         self.runner
-            .run_test_internal(self.image_name.clone(), test, f);
+            .run_test_internal(self.image_name.clone(), config, f);
+    }
+
+    /// Starts a subsequent integration test run with inherited configuration.
+    ///
+    /// This function is the same as [`TestContext::run_test`] but automatically inherits the
+    /// configuration from the previous test run. See [`TestContext::run_test`] for details.
+    ///
+    /// # Panics
+    /// - When the app could not be copied
+    /// - When this crate could not be packaged as a buildpack
+    /// - When the `pack` command unexpectedly fails
+    pub fn run_test_inherit_config<F: FnOnce(TestContext)>(self, f: F) {
+        self.runner
+            .run_test_internal(self.image_name.clone(), self.config.clone(), f);
     }
 }
 

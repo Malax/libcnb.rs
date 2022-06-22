@@ -2,7 +2,6 @@ use crate::{
     app, build, util, BuildpackReference, PackBuildCommand, PullPolicy, TestConfig, TestContext,
 };
 use bollard::Docker;
-use std::borrow::BorrowMut;
 use std::env;
 use std::env::VarError;
 use std::path::PathBuf;
@@ -123,37 +122,37 @@ impl TestRunner {
     ///     },
     /// )
     /// ```
-    pub fn run_test<F: FnOnce(TestContext), T: BorrowMut<TestConfig>>(&self, test: T, f: F) {
-        self.run_test_internal(util::random_docker_identifier(), test, f);
+    pub fn run_test<C: Into<TestConfig>, F: FnOnce(TestContext)>(&self, config: C, f: F) {
+        self.run_test_internal(util::random_docker_identifier(), config, f);
     }
 
-    pub(crate) fn run_test_internal<F: FnOnce(TestContext), T: BorrowMut<TestConfig>>(
+    pub(crate) fn run_test_internal<C: Into<TestConfig>, F: FnOnce(TestContext)>(
         &self,
         image_name: String,
-        mut test: T,
+        config: C,
         f: F,
     ) {
-        let test = test.borrow_mut();
+        let config = config.into();
 
-        let app_dir = if test.app_dir.is_relative() {
+        let app_dir = if config.app_dir.is_relative() {
             env::var("CARGO_MANIFEST_DIR")
                 .map(PathBuf::from)
                 .expect("Could not determine Cargo manifest directory")
-                .join(&test.app_dir)
+                .join(&config.app_dir)
         } else {
-            test.app_dir.clone()
+            config.app_dir.clone()
         };
 
         let temp_app_dir =
             app::copy_app(&app_dir).expect("Could not copy app to temporary location");
 
-        if let Some(app_dir_preprocessor) = &test.app_dir_preprocessor {
+        if let Some(app_dir_preprocessor) = &config.app_dir_preprocessor {
             (app_dir_preprocessor)(PathBuf::from(temp_app_dir.path()));
         }
 
-        let temp_crate_buildpack_dir = if test.buildpacks.contains(&BuildpackReference::Crate) {
+        let temp_crate_buildpack_dir = if config.buildpacks.contains(&BuildpackReference::Crate) {
             Some(
-                build::package_crate_buildpack(&test.target_triple)
+                build::package_crate_buildpack(&config.target_triple)
                     .expect("Could not package current crate as buildpack"),
             )
         } else {
@@ -161,18 +160,18 @@ impl TestRunner {
         };
 
         let mut pack_command = PackBuildCommand::new(
-            &test.builder_name,
+            &config.builder_name,
             temp_app_dir.path(),
             &image_name,
             // Prevent redundant image-pulling, which slows tests and risks hitting registry rate limits.
             PullPolicy::IfNotPresent,
         );
 
-        test.env.iter().for_each(|(key, value)| {
+        config.env.iter().for_each(|(key, value)| {
             pack_command.env(key, value);
         });
 
-        for buildpack in &test.buildpacks {
+        for buildpack in &config.buildpacks {
             match buildpack {
                 BuildpackReference::Crate => {
                     pack_command.buildpack(temp_crate_buildpack_dir.as_ref()
@@ -193,8 +192,9 @@ impl TestRunner {
         let test_context = TestContext {
             pack_stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
             pack_stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-            image_name,
             app_dir: PathBuf::from(temp_app_dir.path()),
+            image_name,
+            config,
             runner: self,
         };
 
